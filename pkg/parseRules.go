@@ -39,8 +39,6 @@ func matchCon(event *evtx.GoEvtxMap, filter map[string]interface{}, condition st
 	var andflag int
 	var orflag int
 	var notFlag int
-	//  service_control_manager and (service_name or image_path)
-	// tmd 还有这种情况没处理 todo
 	for _, part := range parts {
 		if part == "and" {
 			andflag = 1
