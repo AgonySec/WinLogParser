@@ -3,14 +3,12 @@ package pkg
 import (
 	"fmt"
 	"github.com/0xrawsec/golang-evtx/evtx"
-	"github.com/xuri/excelize/v2"
 	"gopkg.in/yaml.v3"
-	"io/ioutil"
 	"log"
-	"os"
 	"regexp"
+	"strconv"
 	"strings"
-	"time"
+	"sync"
 )
 
 type Rule struct {
@@ -33,65 +31,49 @@ type Field struct {
 	To   string `yaml:"to"`
 }
 
-func matchEvent(event *evtx.GoEvtxMap, filter map[string]interface{}) bool {
-	// 处理条件逻辑
-	if condition, ok := filter["condition"].(string); ok {
-		// 按空格分割字符串
-		parts := strings.Fields(condition)
-		var conditions []string
-		var andflag int
-		var orflag int
-		var notFlag int
-		//  service_control_manager and (service_name or image_path)
-		// tmd 还有这种情况没处理 todo
-		for _, part := range parts {
-			if part == "and" {
-				andflag = 1
-				continue
-			}
-			if part == "or" {
-				orflag = 1
-				continue
-			}
-			if part == "not" {
-				notFlag = 1
-				continue
-			}
-			conditions = append(conditions, part)
+// service_control_manager and (service_name or image_path)
+func matchCon(event *evtx.GoEvtxMap, filter map[string]interface{}, condition string) bool {
+	// 按空格分割字符串
+	parts := strings.Fields(condition)
+	var conditions []string
+	var andflag int
+	var orflag int
+	var notFlag int
+	//  service_control_manager and (service_name or image_path)
+	// tmd 还有这种情况没处理 todo
+	for _, part := range parts {
+		if part == "and" {
+			andflag = 1
+			continue
 		}
-		if andflag != 0 {
-			var flag = true
-			if notFlag != 0 {
-				for key, cond := range conditions {
-					if key != 0 {
-						if !matchCondition2(event, filter, cond) {
-							flag = false
-						}
-					} else {
-						if !matchCondition(event, filter, cond) {
-							flag = false
-						}
+		if part == "or" {
+			orflag = 1
+			continue
+		}
+		if part == "not" {
+			notFlag = 1
+			continue
+		}
+		conditions = append(conditions, part)
+	}
+	if andflag != 0 {
+		var flag = true
+		if notFlag != 0 {
+			for key, cond := range conditions {
+				if key != 0 {
+					if !matchCondition2(event, filter, cond) {
+						flag = false
 					}
-					if flag == false {
-						return false
-					}
-				}
-				return flag
-			} else {
-				for _, cond := range conditions {
+				} else {
 					if !matchCondition(event, filter, cond) {
-						return false
+						flag = false
 					}
 				}
-				return true
-			}
-		} else if orflag != 0 {
-			for _, cond := range conditions {
-				if matchCondition(event, filter, cond) {
-					return true
+				if flag == false {
+					return false
 				}
 			}
-			return false
+			return flag
 		} else {
 			for _, cond := range conditions {
 				if !matchCondition(event, filter, cond) {
@@ -99,6 +81,36 @@ func matchEvent(event *evtx.GoEvtxMap, filter map[string]interface{}) bool {
 				}
 			}
 			return true
+		}
+	} else if orflag != 0 {
+		for _, cond := range conditions {
+			if matchCondition(event, filter, cond) {
+				return true
+			}
+		}
+		return false
+	} else {
+		for _, cond := range conditions {
+			if !matchCondition(event, filter, cond) {
+				return false
+			}
+		}
+		return true
+	}
+}
+func matchEvent2(event *evtx.GoEvtxMap, filter map[string]interface{}) bool {
+	if condition, ok := filter["condition"].(string); ok {
+		if strings.Contains(condition, "(") {
+			cond := strings.Fields(condition)
+			if !matchCondition(event, filter, cond[0]) {
+				return false
+			}
+			pattern := `\((.*?)\)`
+			re := regexp.MustCompile(pattern)
+			matches := re.FindStringSubmatch(condition)
+			return matchCon(event, filter, matches[1])
+		} else {
+			return matchCon(event, filter, condition)
 		}
 	} else {
 		// 处理如果不存在condition，则直接进行匹配！
@@ -109,8 +121,8 @@ func matchEvent(event *evtx.GoEvtxMap, filter map[string]interface{}) bool {
 		}
 		return true
 	}
-}
 
+}
 func matchCondition(event *evtx.GoEvtxMap, filter map[string]interface{}, condition string) bool {
 	condFilter, ok := filter[condition].(map[string]interface{})
 	if !ok {
@@ -147,17 +159,11 @@ func matchCondition2(event *evtx.GoEvtxMap, filter map[string]interface{}, condi
 	return true
 }
 
-// ConvertPath 将点分隔的路径转换为斜杠分隔的路径
-func ConvertPath(dottedPath string) string {
-	return strings.ReplaceAll(dottedPath, ".", "/")
-}
 func MatchKeyPro(event *evtx.GoEvtxMap, key string, value interface{}, isNot bool) bool {
 
 	slashPath := ConvertPath(key)
 	parts := strings.Split(key, ".")
 	var current interface{}
-	// 初始化 current 为 event
-	// 如果有需要获取 data[0] data[1] 需要处理 todo
 	var status int
 	for _, part := range parts {
 		switch part {
@@ -174,22 +180,45 @@ func MatchKeyPro(event *evtx.GoEvtxMap, key string, value interface{}, isNot boo
 					re := regexp.MustCompile(`\d+`)
 					match = re.FindString(part)
 				}
-				if match == "" {
+				if match != "" {
+					path := evtx.Path("/Event/EventData/Data")
 
+					eventMap2, _ := event.GetMap(&path)
+					if eventMap2 != nil {
+						// 解引用指针并进行类型断言
+						normalMap := map[string]interface{}(*eventMap2)
+						// 获取 Data 值
+						dataValue, _ := normalMap["Data"]
+
+						// 将 dataValue 转换为 []string 类型
+						dataSlice, ok := dataValue.([]string)
+						if ok {
+							for i, j := range dataSlice {
+								if strconv.Itoa(i) == match {
+									current = j
+								}
+							}
+						}
+					}
+					break
 				}
 				path := evtx.Path(slashPath)
 				desValue, _ := event.GetString(&path)
-				if desValue != "" {
-					current = desValue
-					break
-				}
+				current = desValue
 
 			} else if status == 1 {
 				path2 := evtx.Path(slashPath)
 				if part == "Provider" {
 					path2 = evtx.Path(slashPath + "/Name")
 				}
+
 				desValue, _ := event.GetString(&path2)
+				// 如果eventID为空，则尝试获取 /eventID/Value
+				if desValue == "" {
+					path2 = evtx.Path(slashPath + "/Value")
+					desValue, _ = event.GetString(&path2)
+				}
+
 				if desValue != "" {
 					current = desValue
 					break
@@ -199,12 +228,15 @@ func MatchKeyPro(event *evtx.GoEvtxMap, key string, value interface{}, isNot boo
 				desValue, _ := event.GetString(&path3)
 				if desValue != "" {
 					current = desValue
-					break
+				} else {
+					current = ""
 				}
 			}
 		}
 	}
-
+	if value == nil {
+		value = ""
+	}
 	if isNot == false {
 		return matchValue(value, current)
 	}
@@ -241,6 +273,7 @@ func matchValue2(value interface{}, current interface{}) bool {
 		return false
 	}
 }
+
 func matchValue(value interface{}, current interface{}) bool {
 	//fmt.Println(status)
 	switch v := value.(type) {
@@ -250,10 +283,17 @@ func matchValue(value interface{}, current interface{}) bool {
 		if strings.HasPrefix(v, "$*") {
 			return strings.HasPrefix(fmt.Sprintf("%v", current), "$")
 		}
+		if fmt.Sprintf("%v", v) == "" && fmt.Sprintf("%v", current) == "" {
+			return false
+		}
 		return fmt.Sprintf("%v", current) == v
 	case []interface{}:
 		for _, val := range v {
-			if fmt.Sprintf("%v", current) == fmt.Sprintf("%v", val) {
+			if strings.HasPrefix(fmt.Sprintf("%v", val), "i") {
+				if MatchPattern(fmt.Sprintf("%v", val), fmt.Sprintf("%v", current)) {
+					return true
+				}
+			} else if fmt.Sprintf("%v", current) == fmt.Sprintf("%v", val) {
 				return true
 			}
 		}
@@ -263,167 +303,66 @@ func matchValue(value interface{}, current interface{}) bool {
 	}
 }
 
-func GetRuleContent(ruleFilePath string) []byte {
-	// 打开文件
-	file, err := os.Open(ruleFilePath)
-	if err != nil {
-		log.Printf("打开文件时出错: %v", err)
-		return nil
-	}
-	defer file.Close()
+// MatchPattern 检查给定的字符串是否匹配任何一个规则
+func MatchPattern(pattern string, input string) bool {
 
-	// 读取文件内容
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Printf("读取文件内容时出错: %v", err)
+	// 将模式和输入字符串转换为小写进行不区分大小写的匹配
+	lowerPattern := strings.ToLower(pattern)
+	lowerInput := strings.ToLower(input)
 
-	}
-	return content
-
-}
-func MatchAllSecurityRules(event *evtx.GoEvtxMap, SecurityRuleNames []string) Rule {
-
-	for _, ruleName := range SecurityRuleNames {
-		yamlFile := GetRuleContent(ruleName)
-		// 解析 YAML 文件
-		var rule Rule
-		if err := yaml.Unmarshal(yamlFile, &rule); err != nil {
-			log.Fatalf("解析 YAML 文件时出错: %v", err)
+	// 去掉模式中的 "i*" 前缀
+	if strings.HasPrefix(lowerPattern, "i*") {
+		cleanPattern := strings.TrimPrefix(lowerPattern, "i*")
+		// 去掉所有的 "*"
+		cleanPattern = strings.ReplaceAll(cleanPattern, "*", "")
+		if strings.Contains(lowerInput, cleanPattern) {
+			return true
 		}
+	} else if strings.HasPrefix(lowerPattern, "i?") {
+		// 判断是否是正则表达式模式
+		// 去掉前缀 "i?"
+		cleanPattern := lowerPattern[2:]
+		// 编译正则表达式
+		re, _ := regexp.Compile(cleanPattern)
 
-		//rule.Filter = filterRules(rule.Filter)
-		if matchEvent(event, rule.Filter) {
+		// 使用正则表达式进行匹配
+		if re.MatchString(lowerInput) {
+			return true
+		}
+	} else {
+
+	}
+	return false
+}
+
+var ruleCache = make(map[string]Rule)
+var cacheLock sync.Mutex
+
+// 获取规则内容并缓存，做了这个处理之后，tm的运行时间从3m14 直接降到2s左右
+func GetCachedRuleContent(ruleName string) Rule {
+	cacheLock.Lock()
+	defer cacheLock.Unlock()
+
+	if rule, ok := ruleCache[ruleName]; ok {
+		return rule
+	}
+
+	yamlFile := GetRuleContent(ruleName)
+	var rule Rule
+	if err := yaml.Unmarshal(yamlFile, &rule); err != nil {
+		log.Fatalf("解析 YAML 文件时出错: %v", err)
+	}
+	ruleCache[ruleName] = rule
+	return rule
+}
+
+func MatchAllSecurityRules(event *evtx.GoEvtxMap, SecurityRuleNames []string) Rule {
+	for _, ruleName := range SecurityRuleNames {
+		rule := GetCachedRuleContent(ruleName)
+		// 如果事件匹配规则，立即返回
+		if matchEvent2(event, rule.Filter) {
 			return rule
 		}
 	}
 	return Rule{}
-
-}
-func WriteToExcel2(eventResult EventResult, filePath string) error {
-	f := excelize.NewFile()
-	// 创建一个工作表
-	index, _ := f.NewSheet("Sheet1")
-	headers := parseHeader(eventResult.rules)
-	headers = append(headers, "timestamp")
-	headers = append(headers, "detections")
-	headers = append(headers, "path")
-
-	//log.Printf("Headers: %v", headers)
-	// 设置表头
-	for i, header := range headers {
-		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
-		f.SetCellValue("Sheet1", cell, header)
-	}
-
-	// 写入数据
-	for i, event := range eventResult.matchedEvents {
-		row := i + 2 // 从第二行开始写入数据
-
-		for j, name := range headers {
-			var key string
-			if name == "detections" {
-				value := eventResult.rules[i].Title
-				cell, _ := excelize.CoordinatesToCellName(j+1, row)
-				f.SetCellValue("Sheet1", cell, value)
-
-			} else if name == "timestamp" {
-				value := event.TimeCreated()
-
-				// 将 evtx.UTCTime 转换为 string
-				timestampStr := value.Format(time.RFC3339)
-				cell, _ := excelize.CoordinatesToCellName(j+1, row)
-				f.SetCellValue("Sheet1", cell, timestampStr)
-			} else if name == "path" {
-				value := eventResult.evtxFileName[i]
-				cell, _ := excelize.CoordinatesToCellName(j+1, row)
-				f.SetCellValue("Sheet1", cell, value)
-			} else {
-				for _, rule := range eventResult.rules[i].Fields {
-					if rule.Name == name {
-						key = rule.To
-						break
-					}
-				}
-				slashPath := ConvertPath(key)
-				path := evtx.Path(slashPath)
-				if strings.Contains(slashPath, "Provider") {
-					path = evtx.Path(slashPath + "/Name")
-				}
-				var value string
-				if key == "" {
-					value = ""
-				} else {
-					value, _ = event.GetString(&path)
-				}
-
-				cell, _ := excelize.CoordinatesToCellName(j+1, row)
-				f.SetCellValue("Sheet1", cell, value)
-			}
-
-		}
-	}
-
-	// 设置活动工作表
-	f.SetActiveSheet(index)
-
-	// 保存文件
-	if err := f.SaveAs(filePath); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// WriteToExcel 将 matchedEvents 数组的值写入到 Excel 文件中
-func WriteToExcel(matchedEvents []*evtx.GoEvtxMap, filePath string, rules []Rule) error {
-	f := excelize.NewFile()
-
-	// 创建一个工作表
-	index, _ := f.NewSheet("Sheet1")
-	headers := parseHeader(rules)
-
-	// 设置表头
-	for i, header := range headers {
-		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
-		f.SetCellValue("Sheet1", cell, header)
-	}
-
-	// 写入数据
-	for i, event := range matchedEvents {
-		row := i + 2 // 从第二行开始写入数据
-
-		for j, name := range headers {
-			//key := fieldMap[strings.ToLower(name)]
-			var key string
-			for _, rule := range rules[i].Fields {
-				if rule.Name == name {
-					key = rule.To
-					break
-				}
-			}
-
-			slashPath := ConvertPath(key)
-			path := evtx.Path(slashPath)
-			if strings.Contains(slashPath, "Provider") {
-				path = evtx.Path(slashPath + "/Name")
-			}
-
-			value, err := event.GetString(&path)
-			if err != nil {
-				return fmt.Errorf("failed to get value for path %s: %w", slashPath, err)
-			}
-			cell, _ := excelize.CoordinatesToCellName(j+1, row)
-			f.SetCellValue("Sheet1", cell, value)
-		}
-	}
-
-	// 设置活动工作表
-	f.SetActiveSheet(index)
-
-	// 保存文件
-	if err := f.SaveAs(filePath); err != nil {
-		return err
-	}
-
-	return nil
 }

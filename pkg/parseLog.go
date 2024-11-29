@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // 读取指定目录下所有的 .evtx 文件
@@ -47,82 +48,119 @@ func readYMLFiles(dir string, result map[string][]string) error {
 	return err
 }
 
+// 定义 EventMatch 结构体
+type EventMatch struct {
+	event    *evtx.GoEvtxMap
+	rule     Rule
+	fileName string
+}
+
 type EventResult struct {
 	matchedEvents []*evtx.GoEvtxMap
 	rules         []Rule
 	evtxFileName  []string
+	dirName       string
 }
 
-func ReadLog() {
-	evxtDir := "C:\\Users\\chenyuanhang\\Downloads\\Testingggggg\\chainsaw\\EVTX-ATTACK-SAMPLES\\Command and Control"
+func ReadLogPro() {
+	// 获取当前程序所在的目录
+	currentDir, err := os.Getwd()
+	if err != nil {
+		fmt.Println("Error getting current directory:", err)
+		return
+	}
+	// 拼接 evtx 文件夹的路径
+	evtxDir := filepath.Join(currentDir, "evtx")
+
 	// 读取指定目录下的所有 .evtx 文件
-	evtxFiles, err := readEVTXFiles(evxtDir)
+	evtxFiles, err := readEVTXFiles(evtxDir)
+	fmt.Printf("载入 %d EVTX 文件\n", len(evtxFiles))
 	if err != nil {
 		fmt.Printf("Error reading EVTX files: %v\n", err)
 		return
 	}
 	// 初始化结果映射
 	rulesResult := make(map[string][]string)
-	rulesDir := "C:\\Users\\chenyuanhang\\Documents\\WorkSpace\\WinLogParser\\rules\\rdp_attacks"
-
+	rulesDir := filepath.Join(currentDir, "rules")
 	// 读取指定目录下的所有 .yml 文件
 	err = readYMLFiles(rulesDir, rulesResult)
+	fmt.Printf("载入 %d 个规则文件夹\n", len(rulesResult))
 	if err != nil {
 		fmt.Printf("Error reading YML files: %v\n", err)
 		return
 	}
-	// 打印结果
+	// 创建 output 文件夹
+	outputDir := filepath.Join(currentDir, "output")
+	err = os.MkdirAll(outputDir, 0755)
+	if err != nil {
+		fmt.Printf("Error creating output directory: %v\n", err)
+		return
+	}
+	var eventsMap = make(map[string][]*evtx.GoEvtxMap)
+
+	for _, evtxFileName := range evtxFiles {
+		eventFile, err := evtx.OpenDirty(evtxFileName)
+		if err != nil {
+			log.Printf("Failed to open EVTX file %s: %v", evtxFileName, err)
+			continue
+		}
+		var events []*evtx.GoEvtxMap
+		for event := range eventFile.FastEvents() {
+			events = append(events, event)
+		}
+		eventsMap[evtxFileName] = events
+	}
+	// 创建一个等待组，用于等待所有 goroutine 完成
+	var wg sync.WaitGroup
+	// 创建一个通道，用于收集结果
+	resultChan := make(chan EventResult, len(evtxFiles))
+
+	// 限制并发数量
+	const maxConcurrency = 10
+	sem := make(chan struct{}, maxConcurrency)
+
+	// 启动多个 goroutine 处理每个 .evtx 文件
 	for dirName, ymlFiles := range rulesResult {
-		// 打印找到的 .evtx 文件
-		var matchedEvents []*evtx.GoEvtxMap
-		var rules []Rule
-		var evtxFileNames []string
-		var eventResult EventResult
-		for _, evtxFileName := range evtxFiles {
-			eventFile, err := evtx.OpenDirty(evtxFileName)
-			if err != nil {
-				log.Fatal(err)
-			}
-			for event := range eventFile.FastEvents() {
-				rule := MatchAllSecurityRules(event, ymlFiles)
-				if rule.Title != "" {
-					matchedEvents = append(matchedEvents, event)
-					rules = append(rules, rule)
-					evtxFileNames = append(evtxFileNames, evtxFileName)
-					//eventResult = append(eventResult, EventResult{matchedEvents: event, rules: rule, evtxFileName: evtxFileName})
+		wg.Add(1)
+		go func(dirName string, ymlFiles []string) {
+			defer wg.Done()
+			sem <- struct{}{}        // 获取一个许可
+			defer func() { <-sem }() // 释放许可
+
+			// 打印找到的 .evtx 文件
+			var matchedEvents []*evtx.GoEvtxMap
+			var rules []Rule
+			var evtxFileNames []string
+			// 遍历 eventsMap
+			for evtxFileName, events := range eventsMap {
+				for _, event := range events {
+					rule := MatchAllSecurityRules(event, ymlFiles)
+					if rule.Title != "" {
+						matchedEvents = append(matchedEvents, event)
+						rules = append(rules, rule)
+						evtxFileNames = append(evtxFileNames, evtxFileName)
+					}
 				}
 			}
-		}
-		eventResult = EventResult{matchedEvents: matchedEvents, rules: rules, evtxFileName: evtxFileNames}
-		// 写入 Excel 文件
-		filePath := dirName + ".xlsx"
-		if err := WriteToExcel2(eventResult, filePath); err != nil {
-			log.Fatalf("写入 Excel 文件时出错: %v", err)
-		}
-		log.Println("已写入 Excel 文件:", filePath)
+			eventResult := EventResult{matchedEvents: matchedEvents, rules: rules, evtxFileName: evtxFileNames, dirName: dirName}
+			resultChan <- eventResult
+		}(dirName, ymlFiles)
 	}
-}
-func parseHeader(rules []Rule) []string {
-	var fields []Field
-	var header []string
-	for _, rule := range rules {
-		fields = append(fields, rule.Fields...)
-	}
-	for _, field := range fields {
-		fieldName := field.Name
-		if !contains(header, fieldName) {
-			header = append(header, fieldName)
-		}
-	}
-	return header
-}
 
-// 辅助函数，检查切片中是否包含指定的字符串
-func contains(slice []string, str string) bool {
-	for _, item := range slice {
-		if item == str {
-			return true
+	// 等待所有 goroutine 完成
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// 收集所有结果并写入 Excel 文件
+	for eventResult := range resultChan {
+		if len(eventResult.rules) != 0 {
+			filePath := filepath.Join(outputDir, eventResult.dirName+".xlsx")
+			if err := WriteToExcel2(eventResult, filePath); err != nil {
+				log.Fatalf("写入Excel文件出现了一个bug: %v", err)
+			}
+			log.Println("成功写入Excel文件", filePath)
 		}
 	}
-	return false
 }
