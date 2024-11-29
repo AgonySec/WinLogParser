@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"github.com/0xrawsec/golang-evtx/evtx"
 	"github.com/xuri/excelize/v2"
-	"io/ioutil"
 	"log"
 	"os"
 	"regexp"
@@ -29,22 +28,13 @@ func ConvertPath(dottedPath string) string {
 	return strings.ReplaceAll(dottedPath, ".", "/")
 }
 func GetRuleContent(ruleFilePath string) []byte {
-	// 打开文件
-	file, err := os.Open(ruleFilePath)
+	// 读取文件内容
+	content, err := os.ReadFile(ruleFilePath)
 	if err != nil {
-		log.Printf("打开文件时出错: %v", err)
+		log.Printf("读取文件时出错: %v", err)
 		return nil
 	}
-	defer file.Close()
-
-	// 读取文件内容
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Printf("读取文件内容时出错: %v", err)
-
-	}
 	return content
-
 }
 func WriteToExcel2(eventResult EventResult, filePath string) error {
 	f := excelize.NewFile()
