@@ -4,9 +4,23 @@
 
 基于Golang实现的一款本地分析EVTX日志的工具，无需管理员权限和联网，支持自定义规则来进行识别，双击执行后写入Excel文件。
 
+如果对你有帮助的话，可以给博主点个star [Github链接](https://github.com/AgonySec/WinLogParser) 
+
 ## 
 
+## 编译
 
+先clone项目：
+
+```
+git clone https://github.com/AgonySec/WinLogParser.git
+```
+
+编译成可执行文件：
+
+```
+go build -ldflags="-w -s" -o WinLogParser.exe -trimpath .\cmd\main.go
+```
 
 ## 使用
 
@@ -16,7 +30,7 @@
 
 ![image-20241129095013469](assets/image-20241129095013469.png)
 
-如果你想快速体验，可以 clone 这个日志样本仓库到EVTX文件夹中，如何执行EXE
+如果你想快速体验，可以 clone 这个日志样本仓库到EVTX文件夹中，然后再执行EXE
 
 ```
 cd evtx
@@ -33,3 +47,8 @@ git clone https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES.git
 - Windows 11
 
 规则库来源于项目：https://github.com/WithSecureLabs/chainsaw 
+
+
+
+
+
